@@ -1,5 +1,3 @@
-const admin = require('firebase-admin');
-
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const FAQ_COLLECTION = process.env.AI_FAQ_COLLECTION || 'ai_faqs';
@@ -7,39 +5,8 @@ const MIN_FAQ_SCORE = Number(process.env.AI_FAQ_MIN_SCORE || 12);
 
 function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-}
-
-function initFirebaseAdmin() {
-  if (admin.apps.length > 0) return admin;
-
-  const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
-  const serviceAccountKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
-
-  if (serviceAccountBase64) {
-    const serviceAccount = JSON.parse(
-      Buffer.from(serviceAccountBase64, 'base64').toString('utf8')
-    );
-
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-
-    return admin;
-  }
-
-  if (serviceAccountKey) {
-    admin.initializeApp({
-      credential: admin.credential.cert(JSON.parse(serviceAccountKey)),
-    });
-
-    return admin;
-  }
-
-  // Jika backend sudah berjalan di environment Google/Firebase, ini tetap bisa aktif.
-  admin.initializeApp();
-  return admin;
 }
 
 function parseBody(req) {
@@ -51,7 +18,6 @@ function parseBody(req) {
       return {};
     }
   }
-
   return req.body;
 }
 
@@ -85,7 +51,6 @@ function isMontirPediaAllowedQuestion(message) {
   if (!text) return false;
 
   const allowedKeywords = [
-    // Aplikasi dan layanan MontirPedia
     'montirpedia',
     'montir pedia',
     'home service',
@@ -111,8 +76,6 @@ function isMontirPediaAllowedQuestion(message) {
     'customer service',
     'cs',
     'chat mekanik',
-
-    // Kendaraan dan servis
     'motor',
     'mobil',
     'kendaraan',
@@ -212,14 +175,14 @@ function defaultFaqs() {
       category: 'sparepart',
       keywords: ['sparepart', 'suku cadang', 'bayar sparepart'],
       answer:
-        'Untuk layanan Home Service, biaya jasa layanan dibayar melalui aplikasi setelah servis selesai. Biaya sparepart dapat dibayar langsung kepada montir sesuai kesepakatan dan bukti pembelian.',
+        'Untuk Home Service, biaya jasa layanan dibayar melalui aplikasi setelah servis selesai. Biaya sparepart dibayar langsung kepada montir/mekanik sesuai kondisi dan kebutuhan penggantian sparepart.',
     },
     {
       question: 'Apa yang harus dilakukan jika motor mogok?',
       category: 'pertolongan awal',
       keywords: ['motor mogok', 'mogok', 'susah hidup', 'tidak bisa distarter'],
       answer:
-        'Jika motor mogok, cek bahan bakar, posisi standar samping, saklar engine cut-off, kondisi aki, dan suara starter. Jika ada bau bensin, asap tebal, kabel terbakar, atau mesin sangat panas, jangan dipaksa jalan dan hubungi mekanik/CS.',
+        'Jika motor mogok, cek bahan bakar, posisi standar samping, saklar engine cut-off, kondisi aki, dan suara starter. Jika ada bau bensin, asap tebal, kabel terbakar, atau mesin sangat panas, jangan dipaksa jalan dan hubungi mekanik atau CS.',
     },
   ];
 }
@@ -244,27 +207,64 @@ function calculateFaqScore({ userQuestion, faq }) {
     if (userQuestion === keyword) score += 16;
     else if (userQuestion.includes(keyword)) score += 9;
 
-    const parts = keyword.split(' ');
-    for (const part of parts) {
+    for (const part of keyword.split(' ')) {
       if (part.length > 3 && userQuestion.includes(part)) score += 2;
     }
   }
 
   if (category && userQuestion.includes(category)) score += 6;
 
-  const questionWords = question.split(' ');
-  for (const word of questionWords) {
+  for (const word of question.split(' ')) {
     if (word.length > 3 && userQuestion.includes(word)) score += 2;
   }
 
   return score;
 }
 
+function getFirebaseAdminOrNull() {
+  try {
+    // Dibuat lazy require supaya endpoint tidak langsung 500 kalau firebase-admin belum siap.
+    const admin = require('firebase-admin');
+
+    if (admin.apps.length > 0) return admin;
+
+    const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+    const serviceAccountKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+
+    if (serviceAccountBase64) {
+      const serviceAccount = JSON.parse(
+        Buffer.from(serviceAccountBase64, 'base64').toString('utf8')
+      );
+
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+
+      return admin;
+    }
+
+    if (serviceAccountKey) {
+      admin.initializeApp({
+        credential: admin.credential.cert(JSON.parse(serviceAccountKey)),
+      });
+
+      return admin;
+    }
+
+    admin.initializeApp();
+    return admin;
+  } catch (error) {
+    console.error('Firebase Admin tidak aktif:', error.message);
+    return null;
+  }
+}
+
 async function loadFaqsFromFirestore() {
   try {
-    const firebaseAdmin = initFirebaseAdmin();
-    const db = firebaseAdmin.firestore();
+    const admin = getFirebaseAdminOrNull();
+    if (!admin) return defaultFaqs();
 
+    const db = admin.firestore();
     const snapshot = await db
       .collection(FAQ_COLLECTION)
       .where('isActive', '==', true)
@@ -299,17 +299,15 @@ async function findAnswerFromDatabase(message) {
     }
   }
 
-  if (!bestFaq || bestScore < MIN_FAQ_SCORE) {
-    return null;
-  }
+  if (!bestFaq || bestScore < MIN_FAQ_SCORE) return null;
 
   return {
     reply: cleanText(bestFaq.answer),
-    provider: 'firestore',
+    provider: bestFaq.id ? 'firestore' : 'default_faq',
     model: FAQ_COLLECTION,
     score: bestScore,
     source: {
-      type: 'database',
+      type: bestFaq.id ? 'database' : 'default',
       collection: FAQ_COLLECTION,
       id: bestFaq.id || '',
       category: bestFaq.category || '',
@@ -421,10 +419,7 @@ async function askGemini({ message, history, user, appContext }) {
   }
 
   const reply = extractGeminiText(data);
-
-  if (!reply) {
-    throw new Error('Gemini tidak mengirim teks jawaban.');
-  }
+  if (!reply) throw new Error('Gemini tidak mengirim teks jawaban.');
 
   return {
     reply,
@@ -437,6 +432,20 @@ module.exports = async function handler(req, res) {
   setCorsHeaders(res);
 
   if (req.method === 'OPTIONS') return res.status(200).end();
+
+  if (req.method === 'GET') {
+    return res.status(200).json({
+      success: true,
+      endpoint: '/api/ai-chat',
+      method: 'POST',
+      status: 'online',
+      geminiModel: GEMINI_MODEL,
+      hasGeminiKey: Boolean(GEMINI_API_KEY),
+      faqCollection: FAQ_COLLECTION,
+      scope: 'MontirPedia service and vehicle repair only',
+      message: 'Gunakan POST untuk mengirim chat.',
+    });
+  }
 
   if (req.method !== 'POST') {
     return res.status(405).json({
