@@ -261,6 +261,85 @@ function buildCustomerDetails({
   return customer;
 }
 
+
+function extractMidtransErrorMessage(decodedResponse) {
+  if (!decodedResponse || typeof decodedResponse !== 'object') {
+    return 'Midtrans menolak pembuatan transaksi.';
+  }
+
+  const candidates = [
+    decodedResponse.status_message,
+    decodedResponse.message,
+    decodedResponse.error_message,
+    decodedResponse.error,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  const arrayCandidates = [
+    decodedResponse.error_messages,
+    decodedResponse.validation_messages,
+    decodedResponse.errors,
+  ];
+
+  for (const candidate of arrayCandidates) {
+    if (Array.isArray(candidate)) {
+      const message = candidate
+        .map((item) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item.message === 'string') return item.message;
+          return '';
+        })
+        .filter(Boolean)
+        .join(', ')
+        .trim();
+
+      if (message) return message;
+    }
+  }
+
+  if (typeof decodedResponse.raw === 'string' && decodedResponse.raw.trim()) {
+    return decodedResponse.raw.trim().slice(0, 500);
+  }
+
+  return 'Midtrans menolak pembuatan transaksi.';
+}
+
+function enabledPaymentsFromEnv() {
+  const raw = String(process.env.MIDTRANS_ENABLED_PAYMENTS || '').trim();
+
+  if (!raw) return null;
+
+  const allowedPayments = new Set([
+    'credit_card',
+    'bca_va',
+    'bni_va',
+    'bri_va',
+    'permata_va',
+    'other_va',
+    'echannel',
+    'gopay',
+    'shopeepay',
+    'qris',
+    'indomaret',
+    'alfamart',
+    'akulaku',
+    'kredivo',
+  ]);
+
+  const payments = raw
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item && allowedPayments.has(item));
+
+  return payments.length > 0 ? payments : null;
+}
+
+
 function buildMidtransPayload({
   orderId,
   requestId,
@@ -305,11 +384,10 @@ function buildMidtransPayload({
     };
   }
 
-  if (process.env.MIDTRANS_ENABLED_PAYMENTS) {
-    payload.enabled_payments = process.env.MIDTRANS_ENABLED_PAYMENTS
-      .split(',')
-      .map((item) => item.trim())
-      .filter(Boolean);
+  const enabledPayments = enabledPaymentsFromEnv();
+
+  if (enabledPayments) {
+    payload.enabled_payments = enabledPayments;
   }
 
   return payload;
@@ -321,6 +399,21 @@ async function handler(req, res) {
   if (req.method === 'OPTIONS') {
     res.statusCode = 200;
     return res.end();
+  }
+
+  if (req.method === 'GET') {
+    return sendJson(res, 200, {
+      ok: true,
+      success: true,
+      endpoint: '/api/create-midtrans-transaction',
+      method: 'POST',
+      status: 'online',
+      environment: 'sandbox',
+      hasMidtransServerKey: Boolean(process.env.MIDTRANS_SERVER_KEY),
+      serverKeyPrefix: String(process.env.MIDTRANS_SERVER_KEY || '').startsWith('SB-Mid-server-')
+        ? 'sandbox'
+        : 'invalid_or_production',
+    });
   }
 
   if (req.method !== 'POST') {
@@ -526,12 +619,23 @@ async function handler(req, res) {
     }
 
     if (!midtransResponse.ok) {
+      const midtransMessage = extractMidtransErrorMessage(decodedResponse);
+
+      console.error('Midtrans reject create transaction:', {
+        status: midtransResponse.status,
+        message: midtransMessage,
+        request: midtransBody,
+        response: decodedResponse,
+      });
+
       return sendJson(res, midtransResponse.status, {
         ok: false,
         success: false,
-        message: 'Midtrans menolak pembuatan transaksi.',
+        message: midtransMessage,
         midtransStatusCode: midtransResponse.status,
         midtransResponse: decodedResponse,
+        debugHint:
+          'Cek MIDTRANS_SERVER_KEY Sandbox, MIDTRANS_ENABLED_PAYMENTS, dan payload transaksi di Vercel Logs.',
       });
     }
 
@@ -539,10 +643,13 @@ async function handler(req, res) {
     const paymentUrl = String(decodedResponse?.redirect_url || '').trim();
 
     if (!snapToken || !paymentUrl) {
+      const midtransMessage = extractMidtransErrorMessage(decodedResponse);
+
       return sendJson(res, 502, {
         ok: false,
         success: false,
         message:
+          midtransMessage ||
           'Midtrans berhasil dipanggil, tetapi token atau redirect_url tidak ditemukan.',
         midtransResponse: decodedResponse,
       });
