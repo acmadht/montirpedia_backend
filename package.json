@@ -1,0 +1,21 @@
+{
+  "name": "montirpedia-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend MontirPedia untuk Midtrans payment dan notifikasi order.",
+  "main": "index.js",
+  "scripts": {
+    "lint": "node --check api/create-midtrans-transaction.js && node --check api/midtrans-notification.js && node --check lib/firebaseAdmin.js",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "firebase-admin": "^13.0.2"
+  },
+  "devDependencies": {
+    "vercel": "^54.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
