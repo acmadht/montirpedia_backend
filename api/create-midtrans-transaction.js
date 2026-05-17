@@ -6,10 +6,27 @@ const {
 
 const SNAP_TRANSACTION_TARGET = '/snap/v1/transactions';
 
+function getFetch() {
+  if (typeof fetch === 'function') {
+    return fetch;
+  }
+
+  if (typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function') {
+    return globalThis.fetch.bind(globalThis);
+  }
+
+  try {
+    return require('node-fetch');
+  } catch (_) {
+    return null;
+  }
+}
+
 const ALLOWED_COLLECTIONS = new Set([
   'pickup_delivery_requests',
   'service_requests',
   'booking_requests',
+  'booking_jadwal',
   'sparepart_orders',
   'orders',
 ]);
@@ -48,9 +65,9 @@ function parseBody(req) {
 }
 
 function isProduction() {
-  return String(process.env.MIDTRANS_IS_PRODUCTION || 'false')
-    .toLowerCase()
-    .trim() === 'true';
+  // Untuk versi pengembangan/lomba ini pembayaran dipaksa Sandbox.
+  // Jangan memakai Production dari aplikasi sampai benar-benar siap rilis.
+  return false;
 }
 
 function getMidtransConfig() {
@@ -60,28 +77,50 @@ function getMidtransConfig() {
     throw new Error('MIDTRANS_SERVER_KEY belum diatur di environment backend.');
   }
 
-  const production = isProduction();
-
-  if (production && serverKey.startsWith('SB-Mid-server-')) {
+  if (!serverKey.startsWith('SB-Mid-server-')) {
     throw new Error(
-      'MIDTRANS_IS_PRODUCTION=true, tetapi server key yang dipakai masih Sandbox. Gunakan Mid-server-xxxxx atau ubah MIDTRANS_IS_PRODUCTION=false.'
-    );
-  }
-
-  if (!production && serverKey.startsWith('Mid-server-')) {
-    throw new Error(
-      'MIDTRANS_IS_PRODUCTION=false, tetapi server key yang dipakai adalah Production. Gunakan SB-Mid-server-xxxxx atau ubah MIDTRANS_IS_PRODUCTION=true.'
+      'Backend masih memakai MIDTRANS_SERVER_KEY Production. Untuk Sandbox wajib gunakan Server Key yang diawali SB-Mid-server-.'
     );
   }
 
   return {
     serverKey,
-    isProduction: production,
-    snapBaseUrl: production
-      ? 'https://app.midtrans.com'
-      : 'https://app.sandbox.midtrans.com',
-    environment: production ? 'production' : 'sandbox',
+    isProduction: false,
+    snapBaseUrl: 'https://app.sandbox.midtrans.com',
+    environment: 'sandbox',
   };
+}
+
+function isMidtransProductionUrl(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    const host = parsed.hostname.toLowerCase();
+
+    return (
+      host.includes('midtrans.com') &&
+      !host.includes('sandbox') &&
+      !host.includes('localhost')
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+function isMidtransSandboxUrl(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    const host = parsed.hostname.toLowerCase();
+
+    return (
+      host.includes('sandbox.midtrans.com') ||
+      host.includes('app.sandbox.midtrans.com') ||
+      host.includes('api.sandbox.midtrans.com') ||
+      host.includes('localhost') ||
+      host.includes('127.0.0.1')
+    );
+  } catch (_) {
+    return false;
+  }
 }
 
 function createMidtransHeaders() {
@@ -356,22 +395,53 @@ async function handler(req, res) {
     if (
       existingGateway === 'midtrans' &&
       existingPaymentUrl &&
+      existingToken &&
       existingStatus === 'pending'
     ) {
-      return sendJson(res, 200, {
-        ok: true,
-        success: true,
-        paymentUrl: existingPaymentUrl,
-        redirectUrl: existingPaymentUrl,
-        redirect_url: existingPaymentUrl,
-        snapUrl: existingPaymentUrl,
-        token: existingToken,
-        snapToken: existingToken,
-        invoiceNumber: existingOrderId,
-        paymentOrderId: existingOrderId,
-        midtransOrderId: existingOrderId,
-        reused: true,
-      });
+      if (isMidtransSandboxUrl(existingPaymentUrl)) {
+        return sendJson(res, 200, {
+          ok: true,
+          success: true,
+          paymentUrl: existingPaymentUrl,
+          redirectUrl: existingPaymentUrl,
+          redirect_url: existingPaymentUrl,
+          snapUrl: existingPaymentUrl,
+          token: existingToken,
+          snapToken: existingToken,
+          invoiceNumber: existingOrderId,
+          paymentOrderId: existingOrderId,
+          midtransOrderId: existingOrderId,
+          paymentEnvironment: 'sandbox',
+          reused: true,
+        });
+      }
+
+      // Jika URL lama adalah Production atau bukan Sandbox, hapus agar transaksi baru dibuat.
+      await orderRef.set(
+        {
+          paymentUrl: admin.firestore.FieldValue.delete(),
+          midtransPaymentUrl: admin.firestore.FieldValue.delete(),
+          redirectUrl: admin.firestore.FieldValue.delete(),
+          redirect_url: admin.firestore.FieldValue.delete(),
+          checkoutUrl: admin.firestore.FieldValue.delete(),
+          snapUrl: admin.firestore.FieldValue.delete(),
+          midtransSnapToken: admin.firestore.FieldValue.delete(),
+          paymentOrderId: admin.firestore.FieldValue.delete(),
+          midtransOrderId: admin.firestore.FieldValue.delete(),
+          paymentReady: false,
+          paymentStatus: 'pending_reset_to_sandbox',
+          paymentStatusLabel: isMidtransProductionUrl(existingPaymentUrl)
+            ? 'URL Production lama dihapus, membuat Sandbox baru'
+            : 'URL lama bukan Sandbox, membuat Sandbox baru',
+          paymentEnvironment: 'sandbox',
+          midtransEnvironment: 'sandbox',
+          environment: 'sandbox',
+          isProduction: false,
+          isProductionPayment: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
     }
 
     const { snapBaseUrl, environment } = getMidtransConfig();
@@ -425,7 +495,15 @@ async function handler(req, res) {
       customerPhone,
     });
 
-    const midtransResponse = await fetch(
+    const fetchFn = getFetch();
+
+    if (!fetchFn) {
+      throw new Error(
+        'Fetch API tidak tersedia di environment backend. Pastikan Node.js 18+ atau pasang paket node-fetch.'
+      );
+    }
+
+    const midtransResponse = await fetchFn(
       `${snapBaseUrl}${SNAP_TRANSACTION_TARGET}`,
       {
         method: 'POST',
@@ -469,6 +547,17 @@ async function handler(req, res) {
       });
     }
 
+    if (isMidtransProductionUrl(paymentUrl) || !isMidtransSandboxUrl(paymentUrl)) {
+      return sendJson(res, 500, {
+        ok: false,
+        success: false,
+        message:
+          'Backend masih menghasilkan URL Midtrans Production atau URL bukan Sandbox. Periksa MIDTRANS_SERVER_KEY dan endpoint Snap Sandbox.',
+        paymentUrl,
+        expectedEnvironment: 'sandbox',
+      });
+    }
+
     const now = admin.firestore.FieldValue.serverTimestamp();
 
     await db.collection('midtrans_payments').doc(orderId).set(
@@ -482,7 +571,7 @@ async function handler(req, res) {
         status: 'pending',
         transactionStatus: 'pending',
         paymentGateway: 'midtrans',
-        paymentMethod: 'Midtrans Snap',
+        paymentMethod: 'Midtrans Sandbox',
         paymentEnvironment: environment,
         paymentUrl,
         redirectUrl: paymentUrl,
@@ -503,11 +592,15 @@ async function handler(req, res) {
       {
         requestId,
         paymentGateway: 'midtrans',
-        paymentMethod: 'Midtrans Snap',
-        metodePembayaran: 'Midtrans Snap',
+        paymentMethod: 'Midtrans Sandbox',
+        metodePembayaran: 'Midtrans Sandbox',
         paymentEnvironment: environment,
+        midtransEnvironment: environment,
+        environment,
+        isProduction: false,
+        isProductionPayment: false,
         paymentStatus: 'pending',
-        paymentStatusLabel: 'Menunggu Pembayaran',
+        paymentStatusLabel: 'Menunggu Pembayaran Sandbox',
         statusOrder: 'Menunggu Pembayaran',
         status: 'Menunggu Pembayaran',
         Status: 'Menunggu Pembayaran',
@@ -538,8 +631,12 @@ async function handler(req, res) {
       paymentOrderId: orderId,
       midtransOrderId: orderId,
       paymentGateway: 'midtrans',
-      paymentMethod: 'Midtrans Snap',
+      paymentMethod: 'Midtrans Sandbox',
       paymentEnvironment: environment,
+      midtransEnvironment: environment,
+      environment,
+      isProduction: false,
+      isProductionPayment: false,
       response: decodedResponse,
     });
   } catch (error) {
