@@ -16,7 +16,8 @@ function getFetch() {
   }
 
   try {
-    return require('node-fetch');
+    const nodeFetch = require('node-fetch');
+    return typeof nodeFetch === 'function' ? nodeFetch : nodeFetch?.default || null;
   } catch (_) {
     return null;
   }
